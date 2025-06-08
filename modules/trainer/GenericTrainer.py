@@ -804,3 +804,6 @@ class GenericTrainer(BaseTrainer):
 
         for handle in self.grad_hook_handles:
             handle.remove()
+
+        self.callbacks.on_update_status("finished")
+

@@ -6,6 +6,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from modules.cloud.LinuxCloud import LinuxCloud
+from modules.cloud.RestCloud import RestCloud
 from modules.cloud.RunpodCloud import RunpodCloud
 from modules.trainer.BaseTrainer import BaseTrainer
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
@@ -38,6 +39,9 @@ class CloudTrainer(BaseTrainer):
                 self.cloud=RunpodCloud(self.remote_config)
             case CloudType.LINUX:
                 self.cloud=LinuxCloud(self.remote_config)
+            case CloudType.REST:
+                self.cloud=RestCloud(self.remote_config)
+
 
     def start(self):
         try:

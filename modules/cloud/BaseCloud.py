@@ -128,3 +128,7 @@ class BaseCloud(metaclass=ABCMeta):
     @abstractmethod
     def delete_workspace(self):
         pass
+
+    @abstractmethod
+    def _connect(self):
+        pass

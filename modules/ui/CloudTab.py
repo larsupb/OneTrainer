@@ -39,6 +39,7 @@ class CloudTab:
         components.options_kv(self.frame, 1, 1, [
             ("RUNPOD", CloudType.RUNPOD),
             ("LINUX", CloudType.LINUX),
+            ("REST", CloudType.REST),
         ], self.ui_state, "cloud.type")
 
         components.label(self.frame, 2, 0, "File sync method",
