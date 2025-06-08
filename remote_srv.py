@@ -219,5 +219,6 @@ def create_app():
 if __name__ == '__main__':
     # Create the Flask app
     app = create_app()
-    # Run the Flask app
-    app.run(debug=False)
+    # Run the Flask app, listen on all interfaces, and use port 5000
+    app.run(host="0.0.0.0", port=5000, debug=True)
+

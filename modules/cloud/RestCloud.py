@@ -131,7 +131,7 @@ class RestCloud(BaseCloud, ABC):
         pass
 
     def _install_onetrainer(self, update: bool = False):
-        pass
+        raise NotImplementedError("Onetrainer installation not supported on this cloud type")
 
     def _make_tensorboard_tunnel(self):
         raise NotImplementedError("Tensorboard tunnel not supported on this cloud type")
