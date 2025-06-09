@@ -5,4 +5,11 @@ services:
             dockerfile: Dockerfile
         image: onetrainer/rest-server:latest
         ports:
-            - "5000:5000"
+            - "8000:8000"
+        deploy:
+            resources:
+                reservations:
+                    devices:
+                        -   driver: nvidia
+                            count: all
+                            capabilities: [ gpu ]
