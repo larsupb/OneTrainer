@@ -211,8 +211,11 @@ async def stop(task_id: str):
     return {"status": "stopped"}
 
 
-@app.post("/delete_workspace")
-async def delete_workspace():
+@app.post("/delete_workspace/{task_id}")
+async def delete_workspace(task_id: str):
+    if task_id not in task_states:
+        raise HTTPException(404, detail="Task not found")
+
     if any(task["easy_status"] == "running" for task in task_states.values()):
         raise HTTPException(400, detail="Cannot delete workspace while tasks are running")
     remove_workspace_files()
