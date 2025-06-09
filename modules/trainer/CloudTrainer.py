@@ -40,7 +40,7 @@ class CloudTrainer(BaseTrainer):
             case CloudType.LINUX:
                 self.cloud=LinuxCloud(self.remote_config)
             case CloudType.REST:
-                self.cloud=RestCloud(self.remote_config)
+                self.cloud=RestCloud(self.remote_config, callbacks)
 
 
     def start(self):
@@ -60,13 +60,13 @@ class CloudTrainer(BaseTrainer):
             self.error_caught=True
             raise
 
-        def on_command(commands : TrainCommands):
+        def on_command(commands: TrainCommands):
             backup_on_command = commands.get_and_reset_on_command() #don't pickle a Callable
             self.cloud.send_commands(commands)
             commands.set_on_command(backup_on_command)
         self.commands.set_on_command(on_command)
 
-        self.stop_event=threading.Event()
+        self.stop_event = threading.Event()
 
         def callback():
             while not self.stop_event.is_set():
@@ -75,7 +75,7 @@ class CloudTrainer(BaseTrainer):
                 except Exception:
                     traceback.print_exc()
                     self.callbacks.on_update_status("error: check the console for more information")
-                time.sleep(1)
+                time.sleep(5)
 
         self.callback_thread = threading.Thread(target=callback)
         self.callback_thread.start()

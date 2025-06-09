@@ -1,224 +1,237 @@
-# use flask to create a server that accepts requests for training
-import io
-import json
-import logging
-import os
-import threading
-import traceback
-import zipfile
-
-from flask import request, jsonify, send_file
+from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks, HTTPException
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+import os, json, zipfile, traceback, threading, logging
+from typing import List, Optional
 
 from modules.trainer.GenericTrainer import GenericTrainer
+from modules.util import TrainProgress
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config import TrainConfig
 
-task_states = dict()
+task_states = {}
+
+app = FastAPI()
+
+# Add CORS if needed
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust in production
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 work_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace-remote")
+output_dir = os.path.join(work_dir, "models")
 models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models-remote")
 cache_dir = os.path.join(work_dir, "cache")
-os.makedirs(work_dir, exist_ok=True)
-os.makedirs(models_dir, exist_ok=True)
-os.makedirs(os.path.join(models_dir, "checkpoints"), exist_ok=True)
-os.makedirs(os.path.join(models_dir, "vae"), exist_ok=True)
-os.makedirs(cache_dir, exist_ok=True)
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        #logging.FileHandler(os.path.join(work_dir, "server.log")),
-        logging.StreamHandler()
-    ]
-)
-logging.log(logging.INFO, f"Using work dir: {work_dir}")
+for path in [work_dir, output_dir, models_dir, cache_dir,
+             os.path.join(models_dir, "checkpoints"), os.path.join(models_dir, "vae")]:
+    os.makedirs(path, exist_ok=True)
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 
 
 def remove_workspace_files():
-    # Delete the workspace
     for root, dirs, files in os.walk(work_dir, topdown=False):
         for name in files:
             os.remove(os.path.join(root, name))
         for name in dirs:
             os.rmdir(os.path.join(root, name))
 
+
+@app.on_event("startup")
+def on_startup():
+    remove_workspace_files()
+
+
 def start_training_wrapper(task_id, config):
     try:
         start_training(task_id, config)
     except Exception as e:
-        # Log the error and store it
         task_states[task_id]["easy_status"] = "failed"
         task_states[task_id]["error"] = str(e)
         task_states[task_id]["traceback"] = traceback.format_exc()
-
-        # Optionally log it somewhere else as well
-        logging.log(logging.ERROR, f"Error in task {task_id}: {e}")
-        logging.log(logging.ERROR, traceback.format_exc())
+        logging.error(f"Error in task {task_id}: {e}")
+        logging.error(traceback.format_exc())
 
 
-def start_training(task_id, train_config_dict: dict):
+def start_training(task_id, train_config_dict):
     train_config = TrainConfig.TrainConfig.default_values()
     train_config.from_dict(train_config_dict)
-
     train_config.workspace_dir = work_dir
 
-    # Create a task state entry
-    task_states[task_id] = {"easy_status": "running"}
+    def on_train_progress(train_progress: TrainProgress, max_sample, max_epoch):
+        task_states[task_id]["progress"] = {
+            "epoch": train_progress.epoch,
+            "epoch_sample": train_progress.epoch_sample,
+            "epoch_step": train_progress.epoch_step,
+            "global_step": train_progress.global_step,
+            "max_sample": max_sample,
+            "max_epoch": max_epoch
+        }
 
     callbacks = TrainCallbacks()
-    callbacks.set_on_update_train_progress(lambda progress, a, b:
-                                           task_states[task_id].update({"progress": progress.to_dict()}))
-    callbacks.set_on_update_status(lambda status: task_states[task_id].update({"status": status}))
-    callbacks.set_on_sample_default(lambda sample: task_states[task_id].update({"sample": sample}))
-    callbacks.set_on_sample_custom(lambda sample: task_states[task_id].update({"sample": sample}))
+    callbacks.set_on_update_train_progress(on_train_progress)
+    callbacks.set_on_update_status(lambda s: task_states[task_id].update({"status": s}))
+    callbacks.set_on_sample_default(lambda s: task_states[task_id].update({"sample": s}))
+    callbacks.set_on_sample_custom(lambda s: task_states[task_id].update({"sample": s}))
 
     commands = TrainCommands()
     task_states[task_id]["commands"] = commands
+    if train_config.tensorboard:
+        task_states[task_id]["tensorboard_logs"] = os.path.join(train_config.workspace_dir, "tensorboard")
 
     trainer = GenericTrainer(train_config, callbacks, commands)
     trainer.start()
     trainer.train()
     trainer.end()
 
-    task_states[task_id] = {"easy_status": "completed"}
+    task_states[task_id]["easy_status"] = "completed"
 
 
-def stop_training(task_id):
-    if task_id in task_states:
-        task_states[task_id]["commands"].stop()
-        return 200
-    else:
-        return jsonify({"error": "Task not found or not running"}), 404
-
-
-def training_request_handler():
-    # Get the request data
-    data = request.get_data()
-    if not data:
-        return jsonify({"error": "Invalid data"}), 400
-
-    config = json.loads(request.files.get('config').read()) if request.files.get('config') else {}
-    concepts = request.files.getlist('concepts')
-
+@app.post("/train")
+async def train(background_tasks: BackgroundTasks,
+                config: UploadFile = File(...),
+                concepts: List[UploadFile] = File(...)):
     if not config:
-        return jsonify({"error": "Invalid config"}), 400
+        raise HTTPException(400, detail="Invalid config")
     if not concepts or len(concepts) == 0:
-        return jsonify({"error": "No concepts provided"}), 400
+        raise HTTPException(400, detail="No concepts provided")
 
-    # create a random task_id
     task_id = os.urandom(16).hex()
-    task_work_dir = work_dir
+    task_states[task_id] = {"easy_status": "running", "status": "initializing"}
 
-    # Replace the config path in the config with the task work dir
-    config["output_model_destination"] = os.path.join(task_work_dir, "output")
-    # Replace the model path with the remote models directory
-    config["base_model_name"] = os.path.join(models_dir, "checkpoints", os.path.basename(config["base_model_name"]))
-    if config["vae"]["model_name"]:
-        config["vae"]["model_name"] = os.path.join(models_dir, "vae", config["vae"]["model_name"])
-    # Replace the cache path with the work dir and create the cache dir
-    config["cache_dir"] = cache_dir
+    config_data = json.loads(await config.read())
+    filename = config_data["output_model_destination"].split("/")[-1]
+    config_data["output_model_destination"] = os.path.join(output_dir, filename)
 
-    # Unpack training concepts
+    checkpoint_name = config_data["base_model_name"].split("checkpoints/")[-1]
+    config_data["base_model_name"] = os.path.join(models_dir, "checkpoints", checkpoint_name)
+
+    if config_data["vae"]["model_name"]:
+        config_data["vae"]["model_name"] = os.path.join(models_dir, "vae", config_data["vae"]["model_name"])
+
+    config_data["cache_dir"] = cache_dir
+
     for concept in concepts:
-        name, content = concept.filename, concept.read()
-        # write the content to a temporary file
-        zip_file_path = os.path.join(task_work_dir, name + '.zip')
+        name = concept.filename
+        content = await concept.read()
+        zip_path = os.path.join(work_dir, name + '.zip')
+        concept_path = os.path.join(work_dir, 'concepts', name)
+        os.makedirs(concept_path, exist_ok=True)
 
-        target_path = os.path.join(task_work_dir, 'concepts', name)
-        # make sure the target path exists
-        os.makedirs(target_path, exist_ok=True)
-
-        with open(zip_file_path, 'wb') as f:
+        with open(zip_path, 'wb') as f:
             f.write(content)
-        with zipfile.ZipFile(zip_file_path) as zf:
-            zf.extractall(target_path)
-        # Remove the zip file after extraction
-        os.remove(zip_file_path)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(concept_path)
+        os.remove(zip_path)
 
-        # Replace the concept path in the config with the target path
-        # Find the concept name in the config
-        for c in config["concepts"]:
+        for c in config_data["concepts"]:
             if c['name'] == name:
-                # Update the path
-                c["path"] = target_path
+                c["path"] = concept_path
                 break
 
-    # Start the training process in a separate thread and watch for errors
-    threading.Thread(target=start_training_wrapper, args=(task_id, config)).start()
+    background_tasks.add_task(start_training_wrapper, task_id, config_data)
 
-    # return the task_id
-    return jsonify({"task_id": task_id}), 202
+    return JSONResponse({"task_id": task_id}, status_code=202)
 
 
-def create_app():
-    from flask import Flask
-    app = Flask(__name__)
+@app.get("/status/{task_id}")
+async def status(task_id: str):
+    if task_id not in task_states:
+        raise HTTPException(404, detail="Task not found")
+    state = task_states[task_id]
+    result = {
+        "status": state.get("status", ""),
+        "easy_status": state.get("easy_status", "")
+    }
+    if "progress" in state:
+        result["progress"] = state["progress"]
+    return result
 
-    # Clean up the workspace directory on startup
+
+@app.get("/tensorboard/{task_id}")
+async def tensorboard(task_id: str):
+    logs_dir = task_states.get(task_id, {}).get("tensorboard_logs")
+    if not logs_dir or not os.path.exists(logs_dir):
+        raise HTTPException(404, detail="TensorBoard data not found")
+
+    zip_path = os.path.join(work_dir, f"{task_id}_tensorboard_logs.zip")
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        for root, _, files in os.walk(logs_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                zipf.write(file_path, os.path.relpath(file_path, logs_dir))
+    return FileResponse(zip_path, media_type="application/zip", filename=f"{task_id}_tensorboard_logs.zip")
+
+
+@app.get("/files/list/{file_type}/{task_id}")
+async def list_files(file_type: str, task_id: str):
+    if task_id not in task_states:
+        raise HTTPException(404, detail="Task not found")
+    if file_type not in ["samples", "save", "backup"]:
+        raise HTTPException(400, detail="Invalid file type")
+
+    dir_path = os.path.join(work_dir, file_type)
+    if not os.path.exists(dir_path):
+        return []
+
+    files = []
+    for root, _, file_list in os.walk(dir_path):
+        for file in file_list:
+            files.append(os.path.relpath(os.path.join(root, file), dir_path))
+    return files
+
+
+@app.get("/files/download/{file_type}/{task_id}")
+async def download_file(file_type: str, task_id: str, filename: str):
+    if task_id not in task_states:
+        raise HTTPException(404, detail="Task not found")
+    if file_type not in ["samples", "save", "backup"]:
+        raise HTTPException(400, detail="Invalid file type")
+
+    file_path = os.path.join(work_dir, file_type, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(404, detail="File not found")
+
+    return FileResponse(file_path, filename=filename, media_type='application/octet-stream')
+
+
+@app.post("/stop/{task_id}")
+async def stop(task_id: str):
+    if task_id not in task_states:
+        raise HTTPException(404, detail="Task not found")
+
+    commands = task_states[task_id].get("commands")
+    if commands:
+        commands.stop()
+    return {"status": "stopped"}
+
+
+@app.post("/delete_workspace")
+async def delete_workspace():
+    if any(task["easy_status"] == "running" for task in task_states.values()):
+        raise HTTPException(400, detail="Cannot delete workspace while tasks are running")
     remove_workspace_files()
-
-    @app.route('/train', methods=['POST'])
-    def train():
-        return training_request_handler()
-
-    @app.route('/status/<task_id>', methods=['GET'])
-    def status(task_id):
-        if task_id in task_states:
-            out = {
-                "status": task_states[task_id]["status"],
-                "easy_status": task_states[task_id]["easy_status"],
-            }
-            if "progress" in task_states[task_id]:
-                out["progress"] = task_states[task_id]["progress"]
-            return jsonify(out), 200
-        else:
-            return jsonify({"error": "Task not found"}), 404
-
-    @app.route('/stop/<task_id>', methods=['POST'])
-    def stop(task_id):
-        if task_id not in task_states:
-            # Stop the first running task found
-            for k, v in task_states.items():
-                task_id = k
-                break
-        return stop_training(task_id)
-
-    @app.route('/delete_workspace', methods=['POST'])
-    def delete_workspace():
-        # Check if any task is running. If so, do not delete the workspace
-        if any(task["easy_status"] == "running" for task in task_states.values()):
-            return jsonify({"error": "Cannot delete workspace while tasks are running"}), 400
-
-        remove_workspace_files()
-
-    @app.route('/model/<task_id>', methods=['GET'])
-    def get_latest_model(task_id):
-        if task_id in task_states:
-            # Assuming the model is saved in a specific directory
-            model_dir = os.path.join(work_dir, task_id, "model")
-            if os.path.exists(model_dir):
-                # Create a zip file of the model directory
-                zip_file_path = os.path.join(work_dir, f"{task_id}_model.zip")
-                with zipfile.ZipFile(zip_file_path, 'w') as zipf:
-                    for root, _, files in os.walk(model_dir):
-                        for file in files:
-                            file_path = os.path.join(root, file)
-                            zipf.write(file_path, os.path.relpath(file_path, model_dir))
-                return send_file(zip_file_path, as_attachment=True)
-            else:
-                return jsonify({"error": "Model not found"}), 404
-        else:
-            return jsonify({"error": "Task not found"}), 404
-
-    return app
+    return {"status": "workspace deleted"}
 
 
-if __name__ == '__main__':
-    # Create the Flask app
-    app = create_app()
-    # Run the Flask app, listen on all interfaces, and use port 5000
-    app.run(host="0.0.0.0", port=5000, debug=True)
+@app.get("/model/{task_id}")
+async def get_latest_model(task_id: str):
+    if task_id not in task_states:
+        raise HTTPException(404, detail="Task not found")
+    if not os.path.exists(output_dir):
+        raise HTTPException(404, detail="Model not found")
+    files = [f for f in os.listdir(output_dir) if os.path.isfile(os.path.join(output_dir, f))]
+    if not files:
+        raise HTTPException(404, detail="No model file found")
+    latest = max(files, key=lambda f: os.path.getmtime(os.path.join(output_dir, f)))
+    return FileResponse(os.path.join(output_dir, latest), filename=latest)
 
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0", port=8000, log_level="info")
