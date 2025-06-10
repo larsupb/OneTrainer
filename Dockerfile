@@ -32,7 +32,9 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Install additional Python packages in the conda environment
-RUN conda run -p /app/conda_env pip install fastapi==0.111.0 uvicorn[standard]==0.30.1 pydantic==2.7.1 python-multipart==0.0.9 requests==2.31.0
+RUN conda run -p /app/conda_env pip install fastapi uvicorn[standard] pydantic python-multipart requests
+
+RUN conda run -p /app/conda_env pip install bitsandbytes
 
 COPY remote_srv.py /app/remote_srv.py
 
