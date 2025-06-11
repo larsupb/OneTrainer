@@ -6,6 +6,9 @@ services:
         image: onetrainer/rest-server:latest
         ports:
             - "8000:8000"
+        # YOU NEED TO DO:
+        # volumes:
+        #    - #YOUR_LOCAL_CHECKPOINTS_DIR:/app/models-remote
         deploy:
             resources:
                 reservations:

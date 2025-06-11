@@ -2,7 +2,6 @@ import json
 import logging
 import os
 import tempfile
-import threading
 import time
 import zipfile
 from abc import ABC
@@ -21,15 +20,13 @@ FILE_UPDATE_INTERVAL_SECS = 60
 
 
 class RestCloud(BaseCloud, ABC):
-    def __init__(self, config: TrainConfig, callback: TrainCallbacks = None, reattach: bool = False):
+    def __init__(self, config: TrainConfig, callback: TrainCallbacks = None):
         super().__init__(config)
+        self.last_alive_status = None
         self.config = config
         self.callback = callback
-        self.reattach = reattach
         self.last_status = "initializing"
-
-        self.task_id = config.cloud.run_id if reattach and config.cloud.run_id else None
-        self.stop_event = threading.Event()
+        self.task_id = None
 
     def run_trainer(self):
         if not self.can_reattach():
@@ -40,32 +37,15 @@ class RestCloud(BaseCloud, ABC):
         else:
             logging.info(f"Attaching to existing task ID: {self.task_id}")
 
-        updater_thread = threading.Thread(target=self.file_update_wrapper)
-        updater_thread.daemon = True
-        updater_thread.start()
-        updater_thread.join()
-
     def _url(self, endpoint: str, argument=None) -> str:
         # build url by combining the connection info from secrets file
         # secrets.host, port=secrets.port, user=secrets.user
-        url = f"http://{self.config.secrets.cloud.host}:{self.config.secrets.cloud.port}/{endpoint}"
+        url = f"{self.config.secrets.cloud.host}:{self.config.secrets.cloud.port}/{endpoint}"
         if argument:
             url += f"/{argument}"
         return url
 
-    # Start the file downloader thread
-    def file_update_wrapper(self):
-        while not self.stop_event.is_set():
-            if self.last_status != "initializing":
-                try:
-                    # Get the latest tensorboard data and overwrite the old one
-                    self.get_tensorboard_data()
-                    # Get the latest file updates (samples, saves, backups)
-                    self.get_file_updates()
-                except Exception as e:
-                    logging.error(f"Error while getting file updates: {e}")
-            # Sleep for a while before checking for updates again
-            time.sleep(FILE_UPDATE_INTERVAL_SECS)
+    # 71b08149dfb6b260a4e32c4b68537f8a
 
     @staticmethod
     def pack_concept(local: Path, recursive: bool):
@@ -92,6 +72,8 @@ class RestCloud(BaseCloud, ABC):
         file.seek(0)
         data = file.read()
         file.close()
+
+        logging.info(f"Packed concept {local} into a zip file of size {len(data) / (1024 * 1024):.2f} MB")
         return data
 
     @staticmethod
@@ -110,18 +92,20 @@ class RestCloud(BaseCloud, ABC):
         for c in train_config.concepts:
             if not c.enabled:
                 continue
-            print(f"Bundling concept {c.name}...")
+            logging.info(f"Bundling concept {c.name}...")
             binary_data = RestCloud.pack_concept(Path(c.local_path), recursive=c.include_subdirectories)
             concept_data.append(
                 ('concepts', (os.path.basename(c.name), binary_data, 'application/zip')))
         data.extend(concept_data)
 
+        logging.info(f"Uploading concept data and requesting training with config.")
         response = requests.post(url, files=data)
         if response.status_code == 202:
-            print("Training started successfully.")
-            return response.json()["task_id"]
+            logging.info("Training started successfully.")
+            response_json = response.json()
+            return response_json["task_id"]
         else:
-            print(f"Error starting training: {response}")
+            logging.error(f"Could not start training: {response}")
 
     def get_tensorboard_data(self):
         response = requests.get(self._url("tensorboard", self.task_id))
@@ -138,6 +122,77 @@ class RestCloud(BaseCloud, ABC):
         else:
             logging.warning(f"Error getting tensorboard data: {response}")
             return None
+
+    def stop(self):
+        response = requests.post(self._url("stop", self.task_id))
+        if response.status_code != 200:
+            raise Exception(f"Error stopping training: {response}")
+
+    def delete_workspace(self):
+        response = requests.post(self._url("delete_workspace", self.task_id))
+        if response.status_code != 200:
+            raise Exception(f"Error deleting workspace: {response}")
+
+    def send_commands(self, commands: TrainCommands):
+        if commands.get_stop_command():
+            logging.info("Sending stop command to remote server.")
+            self.stop()
+
+    def download_output_model(self):
+        logging.info("Downloading output model...")
+        response = requests.get(self._url("model", self.task_id))
+        if response.status_code == 200:
+            if not self.config.output_model_destination:
+                logging.error("No output model destination specified in config.")
+
+            filename = self.config.output_model_destination
+            # remove the path and keep only the filename (keep the extension)
+            filename = os.path.basename(filename)
+
+            target_path = os.path.join(os.getcwd(), "models", filename)
+            with open(target_path, 'wb') as f:
+                f.write(response.content)
+        else:
+            raise Exception(f"Error downloading model: {response}")
+
+    def _connect(self):
+        pass
+
+    def setup(self):
+        self.last_status = "initializing"
+        self.task_id = self.config.cloud.run_id if self.config.cloud.run_id else None
+
+    def _install_onetrainer(self, update: bool = False):
+        # We do not need to install onetrainer
+        pass
+
+    def _make_tensorboard_tunnel(self):
+        # We do not need to make a tunnel for tensorboard, as tensorboard data is downloaded directly
+        pass
+
+    def upload_config(self, commands: TrainCommands = None):
+        # We do not need to upload the config file, as it is already included in the request_training function
+        pass
+
+    def _upload_config_file(self, local: Path):
+        # We do not need to upload the config file, as it is already included in the request_training function
+        pass
+
+    def can_reattach(self) -> bool:
+        if self.task_id is None:
+            return False
+        return self.get_update() != "unknown"
+
+    def sync_workspace(self):
+        if self.last_status is None or self.last_status == "initializing":
+            return
+        try:
+            # Get the latest tensorboard data and overwrite the old one
+            self.get_tensorboard_data()
+            # Get the latest file updates (samples, saves, backups)
+            self.get_file_updates()
+        except Exception as e:
+            logging.error(f"Error while syncing workspace: {e}")
 
     def get_file_updates(self):
         if self.config.cloud.download_samples:
@@ -192,73 +247,21 @@ class RestCloud(BaseCloud, ABC):
         else:
             logging.error(f"Error downloading {file_type} file {remote_file}: {response.status_code} - {response.text}")
 
-    def stop(self):
-        response = requests.post(self._url("stop", self.task_id))
-        if response.status_code != 200:
-            raise Exception(f"Error stopping training: {response}")
-
-    def delete_workspace(self):
-        response = requests.post(self._url("delete_workspace", self.task_id))
-        if response.status_code != 200:
-            raise Exception(f"Error deleting workspace: {response}")
-
-    def send_commands(self, commands: TrainCommands):
-        if commands.get_stop_command():
-            logging.info("Sending stop command to remote server.")
-            self.stop()
-
-    def download_output_model(self):
-        logging.info("Downloading output model...")
-        response = requests.get(self._url("model", self.task_id))
-        if response.status_code == 200:
-            if not self.config.output_model_destination:
-                logging.error("No output model destination specified in config.")
-
-            filename = self.config.output_model_destination
-            # remove the path and keep only the filename (keep the extension)
-            filename = os.path.basename(filename)
-
-            target_path = os.path.join(os.getcwd(), "models", filename)
-            with open(target_path, 'wb') as f:
-                f.write(response.content)
-        else:
-            raise Exception(f"Error downloading model: {response}")
-
-    def _connect(self):
-        pass
-
-    def _install_onetrainer(self, update: bool = False):
-        # We do not need to install onetrainer
-        pass
-
-    def _make_tensorboard_tunnel(self):
-        # We do not need to make a tunnel for tensorboard, as tensorboard data is downloaded directly
-        pass
-
-    def upload_config(self, commands: TrainCommands = None):
-        # We do not need to upload the config file, as it is already included in the request_training function
-        pass
-
-    def _upload_config_file(self, local: Path):
-        # We do not need to upload the config file, as it is already included in the request_training function
-        pass
-
-    def can_reattach(self) -> bool:
-        if self.task_id is None:
-            return False
-        return self.get_update() != "unknown"
-
-
-    def sync_workspace(self):
-        pass
-
     def exec_callback(self, callbacks: TrainCallbacks):
-        self.last_status = self.get_update()
-        # Check if training is finished
-        if self.last_status in ["finished", "failed", "error"]:
-            logging.info(f"Training finished with last_status: {self.last_status}")
-            self.stop()
-            self.stop_event.set()
+        if self.task_id is not None:
+            self.last_status = self.get_update()
+            if self.last_status not in ["unknown", "error", "failed"]:
+                self.last_alive_status = time.time()
+            elif self.last_status == "unknown":
+                logging.warning("Received unknown status from server, retrying...")
+                # if last alive status is more than 60 seconds ago, we assume the server is down
+                if self.last_alive_status is not None and time.time() - self.last_alive_status > 60:
+                    logging.error("Server is down or not responding, stopping training.")
+                    return
+            # Check if training is finished
+            if self.last_status in ["finished", "failed", "error"]:
+                logging.info(f"Training finished with last_status: {self.last_status}")
+                self.task_id = None
 
     def get_update(self):
         response = requests.get(self._url("status", self.task_id))

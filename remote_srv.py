@@ -1,8 +1,13 @@
-from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+import json
+import logging
+import os
+import traceback
+import zipfile
+from typing import List
+
+from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import os, json, zipfile, traceback, threading, logging
-from typing import List, Optional
+from fastapi.responses import JSONResponse, FileResponse
 
 from modules.trainer.GenericTrainer import GenericTrainer
 from modules.util import TrainProgress
@@ -51,11 +56,16 @@ def start_training_wrapper(task_id, config):
     try:
         start_training(task_id, config)
     except Exception as e:
+        logging.error(f"Error in task {task_id}: {e}")
+        logging.error(traceback.format_exc())
+
+        commands = task_states[task_id].get("commands")
+        if commands:
+            commands.stop()
+
         task_states[task_id]["easy_status"] = "failed"
         task_states[task_id]["error"] = str(e)
         task_states[task_id]["traceback"] = traceback.format_exc()
-        logging.error(f"Error in task {task_id}: {e}")
-        logging.error(traceback.format_exc())
 
 
 def start_training(task_id, train_config_dict):

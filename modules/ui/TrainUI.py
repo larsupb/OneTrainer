@@ -602,9 +602,12 @@ class TrainUI(ctk.CTk):
             if self.train_config.cloud.enabled:
                 self.ui_state.get_var("secrets.cloud").update(self.train_config.secrets.cloud)
             trainer.train()
-        except Exception:
+        except Exception as e:
             if self.train_config.cloud.enabled:
                 self.ui_state.get_var("secrets.cloud").update(self.train_config.secrets.cloud)
+
+            self.on_update_status(f"error: {e}")
+
             error_caught = True
             traceback.print_exc()
 
