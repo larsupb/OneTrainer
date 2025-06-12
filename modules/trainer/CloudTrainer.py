@@ -1,3 +1,4 @@
+import logging
 import os
 import threading
 import time
@@ -88,6 +89,7 @@ class CloudTrainer(BaseTrainer):
                     traceback.print_exc()
                     self.callbacks.on_update_status("error: check the console for more information")
                 time.sleep(5)
+            logging.info("Cloud sync thread stopped")
 
         self.sync_thread = threading.Thread(target=sync)
         self.sync_thread.start()

@@ -6,6 +6,7 @@ import time
 import zipfile
 from abc import ABC
 from pathlib import Path
+from typing import Any
 
 import requests
 
@@ -16,7 +17,6 @@ from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.TrainConfig import TrainConfig
 
 UPDATE_INTERVAL_SECS = 10
-FILE_UPDATE_INTERVAL_SECS = 60
 
 
 class RestCloud(BaseCloud, ABC):
@@ -37,6 +37,13 @@ class RestCloud(BaseCloud, ABC):
         else:
             logging.info(f"Attaching to existing task ID: {self.task_id}")
 
+        # Wait until status is "finished" or "failed"
+        while True:
+            if self.last_status in ["finished", "failed", "error"]:
+                logging.info(f"Training finished with status: {self.last_status}")
+                break
+            time.sleep(UPDATE_INTERVAL_SECS)
+
     def _url(self, endpoint: str, argument=None) -> str:
         # build url by combining the connection info from secrets file
         # secrets.host, port=secrets.port, user=secrets.user
@@ -44,8 +51,6 @@ class RestCloud(BaseCloud, ABC):
         if argument:
             url += f"/{argument}"
         return url
-
-    # 71b08149dfb6b260a4e32c4b68537f8a
 
     @staticmethod
     def pack_concept(local: Path, recursive: bool):
@@ -77,7 +82,7 @@ class RestCloud(BaseCloud, ABC):
         return data
 
     @staticmethod
-    def request_training(url, train_config: TrainConfig) -> str:
+    def request_training(url, train_config: TrainConfig):
         """
         Request training on a remote server via REST API
         Returns the task ID if successful, otherwise None
@@ -106,6 +111,7 @@ class RestCloud(BaseCloud, ABC):
             return response_json["task_id"]
         else:
             logging.error(f"Could not start training: {response}")
+            return None
 
     def get_tensorboard_data(self):
         response = requests.get(self._url("tensorboard", self.task_id))
@@ -137,6 +143,32 @@ class RestCloud(BaseCloud, ABC):
         if commands.get_stop_command():
             logging.info("Sending stop command to remote server.")
             self.stop()
+            return
+
+        for entry in commands.get_and_reset_sample_custom_commands():
+            logging.info(f"Sending custom sample command: {entry}")
+            response = requests.post(self._url("sample_custom", self.task_id), json=entry.to_dict())
+            if response.status_code != 200:
+                logging.error(f"Error sending custom sample command: {response}")
+
+        if commands.get_and_reset_sample_default_command():
+            logging.info("Sending default sample command.")
+            response = requests.post(self._url("sample_default", self.task_id))
+            if response.status_code != 200:
+                logging.error(f"Error sending default sample command: {response}")
+
+        if commands.get_and_reset_backup_command():
+            logging.info("Sending backup command.")
+            response = requests.post(self._url("backup", self.task_id))
+            if response.status_code != 200:
+                logging.error(f"Error sending backup command: {response}")
+
+        if commands.get_and_reset_save_command():
+            logging.info("Sending save command.")
+            response = requests.post(self._url("save", self.task_id))
+            if response.status_code != 200:
+                logging.error(f"Error sending save command: {response}")
+
 
     def download_output_model(self):
         logging.info("Downloading output model...")
@@ -212,7 +244,11 @@ class RestCloud(BaseCloud, ABC):
 
         for root, dirs, files in os.walk(target_dir):
             for file in files:
-                local_files.append(os.path.join(root, file))
+                # file is the relative path + file name but without the root path
+                file_path = os.path.join(root, file)
+                # convert to relative path
+                relative_path = os.path.relpath(file_path, target_dir)
+                local_files.append(relative_path)
 
         response = requests.get(self._url(f"files/list/{file_type}", self.task_id))
         if response.status_code == 200:
@@ -248,20 +284,27 @@ class RestCloud(BaseCloud, ABC):
             logging.error(f"Error downloading {file_type} file {remote_file}: {response.status_code} - {response.text}")
 
     def exec_callback(self, callbacks: TrainCallbacks):
-        if self.task_id is not None:
-            self.last_status = self.get_update()
-            if self.last_status not in ["unknown", "error", "failed"]:
-                self.last_alive_status = time.time()
-            elif self.last_status == "unknown":
-                logging.warning("Received unknown status from server, retrying...")
-                # if last alive status is more than 60 seconds ago, we assume the server is down
-                if self.last_alive_status is not None and time.time() - self.last_alive_status > 60:
-                    logging.error("Server is down or not responding, stopping training.")
-                    return
-            # Check if training is finished
-            if self.last_status in ["finished", "failed", "error"]:
-                logging.info(f"Training finished with last_status: {self.last_status}")
-                self.task_id = None
+        """
+        This method is called periodically to check the training status and progress.
+        """
+        if self.task_id is None:
+            return
+        # We do not want to spam the server with requests, so we only check the status every UPDATE_INTERVAL_SECS seconds
+        # return if last update is less than UPDATE_INTERVAL_SECS seconds ago
+        if (self.last_alive_status is not None
+                and time.time() - self.last_alive_status < UPDATE_INTERVAL_SECS):
+            return
+
+        self.last_status = self.get_update()
+        if self.last_status not in ["unknown", "error", "failed"]:
+            self.last_alive_status = time.time()
+        elif self.last_status == "unknown":
+            logging.warning("Received unknown status from server, retrying...")
+            # if last alive status is more than 60 seconds ago, we assume the server is down
+            if self.last_alive_status is not None and time.time() - self.last_alive_status > 60:
+                logging.error("Server is down or not responding, stopping training.")
+
+
 
     def get_update(self):
         response = requests.get(self._url("status", self.task_id))
