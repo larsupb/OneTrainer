@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 import traceback
 import zipfile
 from typing import List
@@ -27,20 +28,25 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-work_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace-remote")
-output_dir = os.path.join(work_dir, "models")
+base_work_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace-remote")
+output_dir = os.path.join(base_work_dir, "models")
 models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models-remote")
-cache_dir = os.path.join(work_dir, "cache")
+cache_dir = os.path.join(base_work_dir, "cache")
 
-for path in [work_dir, output_dir, models_dir, cache_dir,
+for path in [base_work_dir, output_dir, models_dir, cache_dir,
              os.path.join(models_dir, "checkpoints"), os.path.join(models_dir, "vae")]:
     os.makedirs(path, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 
 
-def remove_workspace_files():
-    for root, dirs, files in os.walk(work_dir, topdown=False):
+def get_task_workdir(task_id):
+    task_dir = os.path.join(base_work_dir, task_id)
+    os.makedirs(task_dir, exist_ok=True)
+    return task_dir
+
+def remove_workspace_files(task_id):
+    for root, dirs, files in os.walk(get_task_workdir(task_id), topdown=False):
         for name in files:
             os.remove(os.path.join(root, name))
         for name in dirs:
@@ -49,7 +55,7 @@ def remove_workspace_files():
 
 @app.on_event("startup")
 def on_startup():
-    remove_workspace_files()
+    remove_workspace_files(base_work_dir)
 
 
 def start_training_wrapper(task_id, config):
@@ -71,7 +77,7 @@ def start_training_wrapper(task_id, config):
 def start_training(task_id, train_config_dict):
     train_config = TrainConfig.TrainConfig.default_values()
     train_config.from_dict(train_config_dict)
-    train_config.workspace_dir = work_dir
+    train_config.workspace_dir = get_task_workdir(task_id)
 
     def on_train_progress(train_progress: TrainProgress, max_sample, max_epoch):
         task_states[task_id]["progress"] = {
@@ -112,7 +118,12 @@ async def train(background_tasks: BackgroundTasks,
         raise HTTPException(400, detail="No concepts provided")
 
     task_id = os.urandom(16).hex()
-    task_states[task_id] = {"easy_status": "running", "status": "initializing"}
+    task_states[task_id] = {"easy_status": "running",
+                            "status": "initializing",
+                            "queue_date": time.time(),
+                            "start_date": None,
+                            "end_date": None,
+                            "log": [],}
 
     config_data = json.loads(await config.read())
     filename = config_data["output_model_destination"].split("/")[-1]
@@ -129,8 +140,8 @@ async def train(background_tasks: BackgroundTasks,
     for concept in concepts:
         name = concept.filename
         content = await concept.read()
-        zip_path = os.path.join(work_dir, name + '.zip')
-        concept_path = os.path.join(work_dir, 'concepts', name)
+        zip_path = os.path.join(get_task_workdir(task_id), name + '.zip')
+        concept_path = os.path.join(get_task_workdir(task_id), 'concepts', name)
         os.makedirs(concept_path, exist_ok=True)
 
         with open(zip_path, 'wb') as f:
@@ -169,7 +180,7 @@ async def tensorboard(task_id: str):
     if not logs_dir or not os.path.exists(logs_dir):
         raise HTTPException(404, detail="TensorBoard data not found")
 
-    zip_path = os.path.join(work_dir, f"{task_id}_tensorboard_logs.zip")
+    zip_path = os.path.join(base_work_dir, f"{task_id}_tensorboard_logs.zip")
     with zipfile.ZipFile(zip_path, 'w') as zipf:
         for root, _, files in os.walk(logs_dir):
             for file in files:
@@ -185,7 +196,7 @@ async def list_files(file_type: str, task_id: str):
     if file_type not in ["samples", "save", "backup"]:
         raise HTTPException(400, detail="Invalid file type")
 
-    dir_path = os.path.join(work_dir, file_type)
+    dir_path = os.path.join(get_task_workdir(task_id), file_type)
     if not os.path.exists(dir_path):
         return []
 
@@ -203,7 +214,7 @@ async def download_file(file_type: str, task_id: str, filename: str):
     if file_type not in ["samples", "save", "backup"]:
         raise HTTPException(400, detail="Invalid file type")
 
-    file_path = os.path.join(work_dir, file_type, filename)
+    file_path = os.path.join(get_task_workdir(task_id), file_type, filename)
     if not os.path.exists(file_path):
         raise HTTPException(404, detail="File not found")
 
@@ -218,7 +229,7 @@ async def stop(task_id: str):
     commands = task_states[task_id].get("commands")
     if commands:
         commands.stop()
-    return {"status": "stopped"}
+    return JSONResponse({"status": "stopping task"}, status_code=200)
 
 
 @app.post("/delete_workspace/{task_id}")
@@ -228,8 +239,8 @@ async def delete_workspace(task_id: str):
 
     if any(task["easy_status"] == "running" for task in task_states.values()):
         raise HTTPException(400, detail="Cannot delete workspace while tasks are running")
-    remove_workspace_files()
-    return {"status": "workspace deleted"}
+    remove_workspace_files(task_id)
+    return JSONResponse({"status": "workspace deleted"}, status_code=200)
 
 
 @app.get("/model/{task_id}")
@@ -244,6 +255,62 @@ async def get_latest_model(task_id: str):
     latest = max(files, key=lambda f: os.path.getmtime(os.path.join(output_dir, f)))
     return FileResponse(os.path.join(output_dir, latest), filename=latest)
 
+
+@app.get("/task")
+async def get_all_tasks():
+    # List all tasks with their IDs and statuses
+    tasks = []
+    for task_id, state in task_states.items():
+        tasks.append({
+            "task_id": task_id,
+            "status": state.get("easy_status", "unknown"),
+            "queue_date": state.get("queue_date"),
+            "start_date": state.get("start_date"),
+            "end_date": state.get("end_date"),
+            "error": state.get("error", ""),
+        })
+    return JSONResponse(tasks, status_code=200)
+
+@app.get("sample_custom/<task_id>")
+async def sample_custom(task_id: str):
+    if task_id not in task_states:
+        raise HTTPException(404, detail="Task not found")
+
+    commands = task_states[task_id].get("commands")
+    if commands:
+        commands.sample_custom()
+    return JSONResponse({"status": "sample_custom executed."}, status_code=200)
+
+
+@app.get("sample_default/<task_id>")
+async def sample_default(task_id: str):
+    if task_id not in task_states:
+        raise HTTPException(404, detail="Task not found")
+
+    commands = task_states[task_id].get("commands")
+    if commands:
+        commands.sample_default()
+    return JSONResponse({"status": "sample_default executed."}, status_code=200)
+
+@app.get("/backup/{task_id}")
+async def backup(task_id: str):
+    if task_id not in task_states:
+        raise HTTPException(404, detail="Task not found")
+
+    commands = task_states[task_id].get("commands")
+    if commands:
+        commands.backup()
+    return JSONResponse({"status": "backup command executed"}, status_code=200)
+
+@app.get("/save/{task_id}")
+async def save(task_id: str):
+    if task_id not in task_states:
+        raise HTTPException(404, detail="Task not found")
+
+    commands = task_states[task_id].get("commands")
+    if commands:
+        commands.save()
+    return JSONResponse({"status": "save command executed"}, status_code=200)
 
 if __name__ == "__main__":
     import uvicorn
