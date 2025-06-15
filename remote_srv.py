@@ -18,6 +18,17 @@ from modules.util.config import TrainConfig
 
 task_states = {}
 
+
+# create enum for task states
+class TaskState:
+    INITIALIZING = "initializing"
+    QUEUED = "queued"
+    RUNNING = "running"
+    FINISHED = "finished"
+    ERROR = "error"
+    UNKNOWN = "unknown"
+
+
 app = FastAPI()
 
 # Add CORS if needed
@@ -33,8 +44,7 @@ output_dir = os.path.join(base_work_dir, "models")
 models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models-remote")
 cache_dir = os.path.join(base_work_dir, "cache")
 
-for path in [base_work_dir, output_dir, models_dir, cache_dir,
-             os.path.join(models_dir, "checkpoints"), os.path.join(models_dir, "vae")]:
+for path in [base_work_dir, output_dir, models_dir, cache_dir]:
     os.makedirs(path, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
@@ -44,6 +54,7 @@ def get_task_workdir(task_id):
     task_dir = os.path.join(base_work_dir, task_id)
     os.makedirs(task_dir, exist_ok=True)
     return task_dir
+
 
 def remove_workspace_files(task_id):
     for root, dirs, files in os.walk(get_task_workdir(task_id), topdown=False):
@@ -61,6 +72,7 @@ def on_startup():
 def start_training_wrapper(task_id, config):
     try:
         start_training(task_id, config)
+
     except Exception as e:
         logging.error(f"Error in task {task_id}: {e}")
         logging.error(traceback.format_exc())
@@ -69,9 +81,8 @@ def start_training_wrapper(task_id, config):
         if commands:
             commands.stop()
 
-        task_states[task_id]["easy_status"] = "failed"
-        task_states[task_id]["error"] = str(e)
-        task_states[task_id]["traceback"] = traceback.format_exc()
+        task_states[task_id]["rest_status"] = TaskState.ERROR
+        task_states[task_id]["log"].append(traceback.format_exc())
 
 
 def start_training(task_id, train_config_dict):
@@ -100,12 +111,14 @@ def start_training(task_id, train_config_dict):
     if train_config.tensorboard:
         task_states[task_id]["tensorboard_logs"] = os.path.join(train_config.workspace_dir, "tensorboard")
 
+    task_states[task_id]["start_date"] = time.time()
+    task_states[task_id]["rest_status"] = TaskState.RUNNING
     trainer = GenericTrainer(train_config, callbacks, commands)
     trainer.start()
     trainer.train()
     trainer.end()
-
-    task_states[task_id]["easy_status"] = "completed"
+    task_states[task_id]["rest_status"] = TaskState.FINISHED
+    task_states[task_id]["end_date"] = time.time()
 
 
 @app.post("/train")
@@ -117,23 +130,26 @@ async def train(background_tasks: BackgroundTasks,
     if not concepts or len(concepts) == 0:
         raise HTTPException(400, detail="No concepts provided")
 
-    task_id = os.urandom(16).hex()
-    task_states[task_id] = {"easy_status": "running",
-                            "status": "initializing",
-                            "queue_date": time.time(),
-                            "start_date": None,
-                            "end_date": None,
-                            "log": [],}
+    task_id = os.urandom(8).hex()
+    task_states[task_id] = {
+        "status": "initializing",
+        "rest_status": TaskState.INITIALIZING,
+        "queue_date": time.time(),
+        "start_date": None,
+        "end_date": None,
+        "log": [],
+    }
 
     config_data = json.loads(await config.read())
     filename = config_data["output_model_destination"].split("/")[-1]
     config_data["output_model_destination"] = os.path.join(output_dir, filename)
 
-    checkpoint_name = config_data["base_model_name"].split("checkpoints/")[-1]
-    config_data["base_model_name"] = os.path.join(models_dir, "checkpoints", checkpoint_name)
+    local_checkpoint = os.path.join(models_dir, config_data["base_model_name"])
+    if os.path.exists(local_checkpoint):
+        config_data["base_model_name"] = local_checkpoint
 
     if config_data["vae"]["model_name"]:
-        config_data["vae"]["model_name"] = os.path.join(models_dir, "vae", config_data["vae"]["model_name"])
+        config_data["vae"]["model_name"] = os.path.join(models_dir, config_data["vae"]["model_name"])
 
     config_data["cache_dir"] = cache_dir
 
@@ -167,7 +183,7 @@ async def status(task_id: str):
     state = task_states[task_id]
     result = {
         "status": state.get("status", ""),
-        "easy_status": state.get("easy_status", "")
+        "rest_status": state.get("rest_status", TaskState.UNKNOWN),
     }
     if "progress" in state:
         result["progress"] = state["progress"]
@@ -229,7 +245,7 @@ async def stop(task_id: str):
     commands = task_states[task_id].get("commands")
     if commands:
         commands.stop()
-    return JSONResponse({"status": "stopping task"}, status_code=200)
+    return JSONResponse({"exec": "stopping task"}, status_code=200)
 
 
 @app.post("/delete_workspace/{task_id}")
@@ -237,10 +253,10 @@ async def delete_workspace(task_id: str):
     if task_id not in task_states:
         raise HTTPException(404, detail="Task not found")
 
-    if any(task["easy_status"] == "running" for task in task_states.values()):
+    if any(task["rest_status"] not in (TaskState.FINISHED, TaskState.ERROR) for task in task_states.values()):
         raise HTTPException(400, detail="Cannot delete workspace while tasks are running")
     remove_workspace_files(task_id)
-    return JSONResponse({"status": "workspace deleted"}, status_code=200)
+    return JSONResponse({"exec": "workspace deleted"}, status_code=200)
 
 
 @app.get("/model/{task_id}")
@@ -263,13 +279,15 @@ async def get_all_tasks():
     for task_id, state in task_states.items():
         tasks.append({
             "task_id": task_id,
-            "status": state.get("easy_status", "unknown"),
+            "status": state.get("status", "unknown"),
+            "rest_status": state.get("rest_status", TaskState.UNKNOWN),
             "queue_date": state.get("queue_date"),
             "start_date": state.get("start_date"),
             "end_date": state.get("end_date"),
             "error": state.get("error", ""),
         })
     return JSONResponse(tasks, status_code=200)
+
 
 @app.get("sample_custom/<task_id>")
 async def sample_custom(task_id: str):
@@ -279,7 +297,7 @@ async def sample_custom(task_id: str):
     commands = task_states[task_id].get("commands")
     if commands:
         commands.sample_custom()
-    return JSONResponse({"status": "sample_custom executed."}, status_code=200)
+    return JSONResponse({"exec": "sample_custom executed."}, status_code=200)
 
 
 @app.get("sample_default/<task_id>")
@@ -290,7 +308,8 @@ async def sample_default(task_id: str):
     commands = task_states[task_id].get("commands")
     if commands:
         commands.sample_default()
-    return JSONResponse({"status": "sample_default executed."}, status_code=200)
+    return JSONResponse({"exec": "sample_default executed."}, status_code=200)
+
 
 @app.get("/backup/{task_id}")
 async def backup(task_id: str):
@@ -300,7 +319,8 @@ async def backup(task_id: str):
     commands = task_states[task_id].get("commands")
     if commands:
         commands.backup()
-    return JSONResponse({"status": "backup command executed"}, status_code=200)
+    return JSONResponse({"exec": "backup command executed"}, status_code=200)
+
 
 @app.get("/save/{task_id}")
 async def save(task_id: str):
@@ -310,8 +330,10 @@ async def save(task_id: str):
     commands = task_states[task_id].get("commands")
     if commands:
         commands.save()
-    return JSONResponse({"status": "save command executed"}, status_code=200)
+    return JSONResponse({"exec": "save command executed"}, status_code=200)
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0", port=8000, log_level="info")
+
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

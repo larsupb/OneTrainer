@@ -54,7 +54,7 @@ if __name__ == "__main__":
         if response.status_code == 200:
             status = response.json()
             print(f"[{count * 5}s] Status: {status}")
-            if status.get("easy_status") in ["completed", "failed"]:
+            if status.get("status") in ["finished", "error"]:
                 break
         else:
             print(f"⚠️ Error getting status: {response.status_code} {response.text}")

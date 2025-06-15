@@ -6,7 +6,6 @@ import time
 import zipfile
 from abc import ABC
 from pathlib import Path
-from typing import Any
 
 import requests
 
@@ -15,6 +14,7 @@ from modules.util.TrainProgress import TrainProgress
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.TrainConfig import TrainConfig
+from remote_srv import TaskState
 
 UPDATE_INTERVAL_SECS = 10
 
@@ -25,7 +25,7 @@ class RestCloud(BaseCloud, ABC):
         self.last_alive_status = None
         self.config = config
         self.callback = callback
-        self.last_status = "initializing"
+        self.last_status = TaskState.QUEUED
         self.task_id = None
 
     def run_trainer(self):
@@ -39,7 +39,7 @@ class RestCloud(BaseCloud, ABC):
 
         # Wait until status is "finished" or "failed"
         while True:
-            if self.last_status in ["finished", "failed", "error"]:
+            if self.last_status in [TaskState.FINISHED, TaskState.ERROR]:
                 logging.info(f"Training finished with status: {self.last_status}")
                 break
             time.sleep(UPDATE_INTERVAL_SECS)
@@ -191,7 +191,7 @@ class RestCloud(BaseCloud, ABC):
         pass
 
     def setup(self):
-        self.last_status = "initializing"
+        self.last_status = TaskState.INITIALIZING
         self.task_id = self.config.cloud.run_id if self.config.cloud.run_id else None
 
     def _install_onetrainer(self, update: bool = False):
@@ -213,10 +213,10 @@ class RestCloud(BaseCloud, ABC):
     def can_reattach(self) -> bool:
         if self.task_id is None:
             return False
-        return self.get_update() != "unknown"
+        return self.get_update() != TaskState.UNKNOWN
 
     def sync_workspace(self):
-        if self.last_status is None or self.last_status == "initializing":
+        if self.last_status is None or self.last_status in (TaskState.QUEUED, TaskState.INITIALIZING):
             return
         try:
             # Get the latest tensorboard data and overwrite the old one
@@ -296,14 +296,15 @@ class RestCloud(BaseCloud, ABC):
             return
 
         self.last_status = self.get_update()
-        if self.last_status not in ["unknown", "error", "failed"]:
+        if self.last_status not in [TaskState.ERROR, TaskState.UNKNOWN]:
             self.last_alive_status = time.time()
-        elif self.last_status == "unknown":
+        elif self.last_status == TaskState.ERROR:
+            raise Exception("An error occurred during training. Please check the server logs for more information.")
+        elif self.last_status == TaskState.UNKNOWN:
             logging.warning("Received unknown status from server, retrying...")
             # if last alive status is more than 60 seconds ago, we assume the server is down
             if self.last_alive_status is not None and time.time() - self.last_alive_status > 60:
-                logging.error("Server is down or not responding, stopping training.")
-
+                raise Exception("Server is down or task ID is invalid. Please check the server status.")
 
 
     def get_update(self):
@@ -323,7 +324,7 @@ class RestCloud(BaseCloud, ABC):
                     progress['max_sample'],
                     progress['max_epoch'],
                 )
-            return data["status"]
+            return data["rest_status"]
         else:
             logging.error(f"Error getting status: {response}")
         return "unknown"
