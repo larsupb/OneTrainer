@@ -10,6 +10,7 @@ from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 
+from OneTrainer.modules.util.config.SampleConfig import SampleConfig
 from modules.trainer.GenericTrainer import GenericTrainer
 from modules.util import TrainProgress
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
@@ -289,18 +290,21 @@ async def get_all_tasks():
     return JSONResponse(tasks, status_code=200)
 
 
-@app.get("sample_custom/<task_id>")
-async def sample_custom(task_id: str):
+@app.post("/sample_custom/{task_id}")
+async def sample_custom(task_id: str, sample_config: dict):
+    if task_id not in task_states:
+        raise HTTPException(404, detail="Task not found")
     if task_id not in task_states:
         raise HTTPException(404, detail="Task not found")
 
+    config: SampleConfig = SampleConfig.from_json_file(sample_config)
     commands = task_states[task_id].get("commands")
     if commands:
-        commands.sample_custom()
+        commands.sample_custom(sample_params=config)
     return JSONResponse({"exec": "sample_custom executed."}, status_code=200)
 
 
-@app.get("sample_default/<task_id>")
+@app.post("sample_default/<task_id>")
 async def sample_default(task_id: str):
     if task_id not in task_states:
         raise HTTPException(404, detail="Task not found")
@@ -311,7 +315,7 @@ async def sample_default(task_id: str):
     return JSONResponse({"exec": "sample_default executed."}, status_code=200)
 
 
-@app.get("/backup/{task_id}")
+@app.post("/backup/{task_id}")
 async def backup(task_id: str):
     if task_id not in task_states:
         raise HTTPException(404, detail="Task not found")
@@ -322,7 +326,7 @@ async def backup(task_id: str):
     return JSONResponse({"exec": "backup command executed"}, status_code=200)
 
 
-@app.get("/save/{task_id}")
+@app.post("/save/{task_id}")
 async def save(task_id: str):
     if task_id not in task_states:
         raise HTTPException(404, detail="Task not found")
